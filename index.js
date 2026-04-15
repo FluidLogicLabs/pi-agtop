@@ -1228,9 +1228,12 @@ async function extractCodexSessionData(sessionFile) {
   });
 
   if (!sawLastUsage)
-    throw new SessionCostError(
-      `No token_count usage events found in ${sessionFile}`
-    );
+    return {
+      session_id: basename(sessionFile, ".jsonl"), lastModel: model || "", models: model ? [model] : [],
+      tokens: { input: 0, output: 0, cache_read: 0, cache_write_5m: 0, cache_write_1h: 0 },
+      costs: { total: "0.00" }, modelBreakdown: [], costsByDay: {}, costsByHour: {},
+      metrics, started_at: null, last_active: null,
+    };
 
   const pricing = resolveCodexPricing(model);
   const inputTokens = totals.input_tokens;
@@ -1785,7 +1788,9 @@ async function safeExtractSessionData(session) {
     }
     return data;
   } catch (err) {
-    if (err instanceof SessionCostError) return null;
+    if (err instanceof SessionCostError) {
+      return { _error: err.message, session_id: session.session_id, tokens: { input: 0, output: 0, total: 0 }, costs: { total: 0 }, metrics: emptyMetrics() };
+    }
     throw err;
   }
 }
@@ -2557,6 +2562,7 @@ const COL_CTX = {
     if (s.list_context.compacting) return "COMPCT";
     const compactAt = s.list_context.max * COMPACT_THRESHOLD;
     const pct = Math.round((s.list_context.used / compactAt) * 100);
+    if (pct > 100) return "\x1b[1;38;5;203m>100%\x1b[0m";
     return pct + "%";
   },
   compare: (a, b) => {
@@ -4166,6 +4172,12 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
   }
   if (!data) {
     allLines.push(C.dimText + "Loading..." + RESET);
+    while (allLines.length < rows) allLines.push("");
+    return allLines;
+  }
+  if (data._error) {
+    allLines.push(C.costRed + "Error reading session data:" + RESET);
+    allLines.push(C.dimText + data._error + RESET);
     while (allLines.length < rows) allLines.push("");
     return allLines;
   }
