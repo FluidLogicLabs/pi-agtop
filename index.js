@@ -2616,31 +2616,57 @@ const QUOTA_TTL_MS = 30_000; // refetch every 30s
 const QUOTA_INTERVAL_TICKS = 5; // only attempt every 5th loadSessions tick
 let _quotaCache = { ts: 0, fetched: false, claude: null, codex: null };
 
+// Both API keys (sk-ant-api...) and OAuth access tokens (sk-ant-oat...) start with "sk-ant-",
+// so the API-key check must use the longer prefix to avoid misclassifying subscription tokens.
+function isClaudeApiKey(tok) {
+  return typeof tok === "string" && tok.startsWith("sk-ant-api");
+}
+
+// Claude Code stores credentials as JSON ({"claudeAiOauth":{"accessToken":...}}) in the
+// keychain and credentials file; very old builds may have stored a bare token string.
+function extractClaudeToken(raw) {
+  const s = (raw || "").trim();
+  if (!s) return null;
+  try {
+    const obj = JSON.parse(s);
+    return obj?.claudeAiOauth?.accessToken
+      || obj?.claudeAiOauth?.access_token
+      || obj?.accessToken
+      || obj?.access_token
+      || null;
+  } catch {
+    return s;
+  }
+}
+
 /**
  * Read Claude credential from macOS keychain or ~/.claude/.credentials.json.
  * Returns { type: "oauth", token } | { type: "api_key" } | { type: "none" }.
  */
 function readClaudeCredential() {
-  // Try keychain first (macOS)
+  // Try keychain first (macOS). Current Claude Code uses "Claude Code-credentials";
+  // older builds used "Claude Code".
   if (process.platform === "darwin") {
-    try {
-      const raw = execSync(
-        'security find-generic-password -s "Claude Code" -w 2>/dev/null',
-        { encoding: "utf-8", timeout: 3000 }
-      ).trim();
-      if (raw) {
-        if (raw.startsWith("sk-ant-")) return { type: "api_key" };
-        return { type: "oauth", token: raw };
-      }
-    } catch { /* not in keychain or not macOS */ }
+    for (const svc of ["Claude Code-credentials", "Claude Code"]) {
+      try {
+        const raw = execSync(
+          `security find-generic-password -s "${svc}" -w 2>/dev/null`,
+          { encoding: "utf-8", timeout: 3000 }
+        );
+        const tok = extractClaudeToken(raw);
+        if (tok) {
+          if (isClaudeApiKey(tok)) return { type: "api_key" };
+          return { type: "oauth", token: tok };
+        }
+      } catch { /* try next */ }
+    }
   }
   // Fallback: credentials file
   try {
     const credPath = join(CLAUDE_CONFIG_DIR, ".credentials.json");
-    const cred = JSON.parse(readFileSync(credPath, "utf-8"));
-    const tok = cred.accessToken || cred.access_token;
+    const tok = extractClaudeToken(readFileSync(credPath, "utf-8"));
     if (tok) {
-      if (tok.startsWith("sk-ant-")) return { type: "api_key" };
+      if (isClaudeApiKey(tok)) return { type: "api_key" };
       return { type: "oauth", token: tok };
     }
   } catch { /* no file */ }
@@ -2648,11 +2674,10 @@ function readClaudeCredential() {
   try {
     const claudeJson = join(homedir(), ".claude.json");
     const data = JSON.parse(readFileSync(claudeJson, "utf-8"));
-    const apiKey = data.primaryApiKey;
-    if (apiKey && apiKey.startsWith("sk-ant-")) return { type: "api_key" };
+    if (isClaudeApiKey(data.primaryApiKey)) return { type: "api_key" };
     const tok = data.oauthAccount?.accessToken || data.oauthAccount?.access_token;
     if (tok) {
-      if (tok.startsWith("sk-ant-")) return { type: "api_key" };
+      if (isClaudeApiKey(tok)) return { type: "api_key" };
       return { type: "oauth", token: tok };
     }
   } catch { /* no file */ }
@@ -2691,12 +2716,12 @@ async function fetchClaudeQuota() {
     });
     if (!resp.ok) return null;
     const data = await resp.json();
-    // Normalize: each window has { utilization: 0-1, resets_at: ISO|epoch }
+    // Normalize: each window has { utilization: 0-100 (percent), resets_at: ISO|epoch }
     const result = { provider: "claude" };
     for (const key of ["five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus", "extra_usage"]) {
       if (data[key] && typeof data[key].utilization === "number") {
         result[key] = {
-          pct: Math.round(data[key].utilization * 100),
+          pct: Math.round(data[key].utilization),
           resets_at: data[key].resets_at || null,
         };
       }
