@@ -79,6 +79,13 @@ const CODEX_PRICING = {
 };
 
 const CLAUDE_PRICING = {
+  "claude-opus-4-7": {
+    input_per_million: 5.0,
+    cache_write_5m_per_million: 6.25,
+    cache_write_1h_per_million: 10.0,
+    cache_read_per_million: 0.5,
+    output_per_million: 25.0,
+  },
   "claude-opus-4-6": {
     input_per_million: 5.0,
     cache_write_5m_per_million: 6.25,
@@ -1133,10 +1140,12 @@ function resolveCodexPricing(model) {
   // Try LiteLLM fallback
   const entry = findLitellmEntry(model, _litellmPricing);
   if (entry) return litellmToCodexPricing(entry);
-  const available = Object.keys(CODEX_PRICING).sort().join(", ") || "(none)";
-  throw new SessionCostError(
-    `No pricing known for Codex model '${model || "unknown"}'. Built-in profiles: ${available}`
-  );
+  // Unknown model: return zero pricing instead of crashing
+  return {
+    input_per_million: 0,
+    cached_input_per_million: 0,
+    output_per_million: 0,
+  };
 }
 
 async function extractCodexSessionData(sessionFile) {
@@ -1300,10 +1309,14 @@ function resolveClaudePricing(model) {
   // Try LiteLLM fallback
   const entry = findLitellmEntry(model, _litellmPricing);
   if (entry) return litellmToClaudePricing(entry);
-  const available = Object.keys(CLAUDE_PRICING).sort().join(", ") || "(none)";
-  throw new SessionCostError(
-    `No pricing known for Claude model '${model}'. Built-in profiles: ${available}`
-  );
+  // Unknown model: return zero pricing instead of crashing
+  return {
+    input_per_million: 0,
+    cache_write_5m_per_million: 0,
+    cache_write_1h_per_million: 0,
+    cache_read_per_million: 0,
+    output_per_million: 0,
+  };
 }
 
 function requestKey(item, message) {
