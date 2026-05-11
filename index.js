@@ -33,6 +33,7 @@ import {
   statSync,
   createReadStream,
   openSync,
+  fstatSync,
   readSync,
   closeSync,
   rmSync,
@@ -79,6 +80,13 @@ const CODEX_PRICING = {
 };
 
 const CLAUDE_PRICING = {
+  "claude-opus-4-7": {
+    input_per_million: 5.0,
+    cache_write_5m_per_million: 6.25,
+    cache_write_1h_per_million: 10.0,
+    cache_read_per_million: 0.5,
+    output_per_million: 25.0,
+  },
   "claude-opus-4-6": {
     input_per_million: 5.0,
     cache_write_5m_per_million: 6.25,
@@ -611,6 +619,47 @@ function readFirstLines(filePath, maxLines) {
   return items;
 }
 
+// Read the last N non-empty JSONL lines from a file, parsing each as JSON.
+// Reads incrementally from the end so it's cheap even on huge files.
+function readLastLines(filePath, maxLines) {
+  let fd;
+  try {
+    fd = openSync(filePath, "r");
+  } catch {
+    return [];
+  }
+  try {
+    const size = fstatSync(fd).size;
+    const chunkSize = 64 * 1024;
+    let pos = size;
+    let buf = "";
+    let items = [];
+    while (pos > 0 && items.length < maxLines) {
+      const readSize = Math.min(chunkSize, pos);
+      pos -= readSize;
+      const chunk = Buffer.alloc(readSize);
+      readSync(fd, chunk, 0, readSize, pos);
+      buf = chunk.toString("utf-8") + buf;
+      const lines = buf.split("\n");
+      // Keep the first (potentially partial) line in buf for next iteration
+      buf = pos > 0 ? lines.shift() : "";
+      // Walk from the end backwards
+      for (let i = lines.length - 1; i >= 0 && items.length < maxLines; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        try {
+          items.push(JSON.parse(line));
+        } catch {
+          /* skip malformed */
+        }
+      }
+    }
+    return items; // newest-first order
+  } finally {
+    try { closeSync(fd); } catch {}
+  }
+}
+
 function fileMtime(filePath) {
   try {
     return statSync(filePath).mtime;
@@ -624,13 +673,14 @@ function fileMtime(filePath) {
 const _sessionStaticCache = new Map(); // transcriptPath → { model, cwd, startedAt }
 
 function collectClaudeSessionSummary(transcriptPath) {
-  // Static fields: read once and cache forever.
+  // Static fields that genuinely never change: model, cwd, startedAt.
   let staticParts = _sessionStaticCache.get(transcriptPath);
+  let aiTitleFromHead = null;
   if (!staticParts) {
     let earliest = null;
     let model = null;
     let cwd = null;
-    for (const item of readFirstLines(transcriptPath, 30)) {
+    for (const item of readFirstLines(transcriptPath, 50)) {
       const parsed = parseTimestamp(item.timestamp);
       if (parsed && (!earliest || parsed < earliest)) earliest = parsed;
       if (!cwd && item.cwd) cwd = item.cwd;
@@ -638,9 +688,19 @@ function collectClaudeSessionSummary(transcriptPath) {
         const candidate = (item.message || {}).model;
         if (candidate && candidate !== "<synthetic>") model = candidate;
       }
+      if (item.type === "ai-title" && typeof item.aiTitle === "string") aiTitleFromHead = item.aiTitle;
     }
-    staticParts = { model, cwd, startedAt: formatTimestampForSession(earliest) };
+    staticParts = { model, cwd, startedAt: formatTimestampForSession(earliest), aiTitle: aiTitleFromHead };
     if (model) _sessionStaticCache.set(transcriptPath, staticParts); // only cache once we have a model
+  }
+  // custom-title (via /rename) is usually set late in a session, so scan the
+  // last lines on every call. Cheap: reads chunks backwards from EOF.
+  let customTitle = null;
+  for (const item of readLastLines(transcriptPath, 200)) {
+    if (item.type === "custom-title" && typeof item.customTitle === "string") {
+      customTitle = item.customTitle;
+      break;
+    }
   }
 
   // Dynamic field: lastActive is just mtime — cheap stat, no file read.
@@ -652,6 +712,7 @@ function collectClaudeSessionSummary(transcriptPath) {
 
   return {
     ...staticParts,
+    customTitle,
     lastActive: latest ? formatTimestampForSession(latest) : null,
   };
 }
@@ -667,6 +728,7 @@ function summarizeClaudeSession(transcriptPath) {
     model: summary.model,
     label_source: summary.cwd,
     data_file: transcriptPath,
+    title: summary.customTitle || summary.aiTitle || null,
   };
 }
 
@@ -1133,10 +1195,12 @@ function resolveCodexPricing(model) {
   // Try LiteLLM fallback
   const entry = findLitellmEntry(model, _litellmPricing);
   if (entry) return litellmToCodexPricing(entry);
-  const available = Object.keys(CODEX_PRICING).sort().join(", ") || "(none)";
-  throw new SessionCostError(
-    `No pricing known for Codex model '${model || "unknown"}'. Built-in profiles: ${available}`
-  );
+  // Unknown model: return zero pricing instead of crashing
+  return {
+    input_per_million: 0,
+    cached_input_per_million: 0,
+    output_per_million: 0,
+  };
 }
 
 async function extractCodexSessionData(sessionFile) {
@@ -1228,9 +1292,12 @@ async function extractCodexSessionData(sessionFile) {
   });
 
   if (!sawLastUsage)
-    throw new SessionCostError(
-      `No token_count usage events found in ${sessionFile}`
-    );
+    return {
+      session_id: basename(sessionFile, ".jsonl"), lastModel: model || "", models: model ? [model] : [],
+      tokens: { input: 0, output: 0, cache_read: 0, cache_write_5m: 0, cache_write_1h: 0 },
+      costs: { total: "0.00" }, modelBreakdown: [], costsByDay: {}, costsByHour: {},
+      metrics, started_at: null, last_active: null,
+    };
 
   const pricing = resolveCodexPricing(model);
   const inputTokens = totals.input_tokens;
@@ -1297,10 +1364,14 @@ function resolveClaudePricing(model) {
   // Try LiteLLM fallback
   const entry = findLitellmEntry(model, _litellmPricing);
   if (entry) return litellmToClaudePricing(entry);
-  const available = Object.keys(CLAUDE_PRICING).sort().join(", ") || "(none)";
-  throw new SessionCostError(
-    `No pricing known for Claude model '${model}'. Built-in profiles: ${available}`
-  );
+  // Unknown model: return zero pricing instead of crashing
+  return {
+    input_per_million: 0,
+    cache_write_5m_per_million: 0,
+    cache_write_1h_per_million: 0,
+    cache_read_per_million: 0,
+    output_per_million: 0,
+  };
 }
 
 function requestKey(item, message) {
@@ -1319,7 +1390,8 @@ async function extractClaudeSessionData(transcriptPath) {
   const models = {};
   let lastModel = null;
   let lastMainModel = null; // model from main session file only (excludes subagent sidechains)
-  let customTitle = null;
+  let customTitle = null;   // /rename — user-set title (preferred)
+  let aiTitle = null;       // AI-generated title (fallback)
   const metrics = emptyMetrics();
   const seenToolIds = new Set();
   const seenUrls = new Set();
@@ -1340,8 +1412,13 @@ async function extractClaudeSessionData(transcriptPath) {
         return;
       }
 
-      if (item.type === "custom-title" && item.customTitle) {
+      // --- Title branches: track user-set and AI-generated session titles ---
+      if (isMainFile && item.type === "custom-title" && typeof item.customTitle === "string") {
         customTitle = item.customTitle;
+        return;
+      }
+      if (isMainFile && item.type === "ai-title" && typeof item.aiTitle === "string") {
+        aiTitle = item.aiTitle;
         return;
       }
 
@@ -1538,6 +1615,9 @@ async function extractClaudeSessionData(transcriptPath) {
 
   return {
     provider: "claude",
+    title: customTitle || aiTitle || null,
+    customTitle, // null if not set via /rename
+    aiTitle,     // null if AI hasn't generated one
     lastModel: lastMainModel || lastModel,
     models: Object.keys(models).sort(),
     modelBreakdown,
@@ -1553,7 +1633,6 @@ async function extractClaudeSessionData(transcriptPath) {
     costsByDay,
     costsByHour,
     metrics,
-    customTitle,
     _localDates: true,
     _noSubagentModel: true, // cache bust: lastModel now excludes subagent sidechain files
   };
@@ -1792,7 +1871,9 @@ async function safeExtractSessionData(session) {
     }
     return data;
   } catch (err) {
-    if (err instanceof SessionCostError) return null;
+    if (err instanceof SessionCostError) {
+      return { _error: err.message, session_id: session.session_id, tokens: { input: 0, output: 0, total: 0 }, costs: { total: 0 }, metrics: emptyMetrics() };
+    }
     throw err;
   }
 }
@@ -2564,6 +2645,7 @@ const COL_CTX = {
     if (s.list_context.compacting) return "COMPCT";
     const compactAt = s.list_context.max * COMPACT_THRESHOLD;
     const pct = Math.round((s.list_context.used / compactAt) * 100);
+    if (pct > 100) return "\x1b[1;38;5;203m>100%\x1b[0m";
     return pct + "%";
   },
   compare: (a, b) => {
@@ -2587,9 +2669,9 @@ const COL_COST_TODAY = {
   compare: (a, b) => (a.list_cost_today || 0) - (b.list_cost_today || 0),
 };
 const COL_PROJECT = {
-  key: "project", label: "PROJECT", width: 0, align: "left", flex: true, desc: "Working directory of the session",
-  render: (s) => s._abbrevLabel || s.label_source || "unknown",
-  compare: (a, b) => (a.label_source || "").localeCompare(b.label_source || ""),
+  key: "project", label: "PROJECT", width: 0, align: "left", flex: true, desc: "Session title (if renamed) or working directory",
+  render: (s) => s.title || s._abbrevLabel || s.label_source || "unknown",
+  compare: (a, b) => (a.title || a.label_source || "").localeCompare(b.title || b.label_source || ""),
 };
 
 const SESSION_COLUMNS = [
@@ -2694,6 +2776,64 @@ function readCodexToken() {
     if (auth.tokens && auth.tokens.access_token) return auth.tokens.access_token;
     if (auth.access_token) return auth.access_token;
   } catch { /* no file */ }
+  return null;
+}
+
+/**
+ * Read Claude account info from ~/.claude.json.
+ * Returns { email, organization, role } | null.
+ */
+let _claudeAccountCache = undefined;
+function readClaudeAccount() {
+  if (_claudeAccountCache !== undefined) return _claudeAccountCache;
+  try {
+    const claudeJson = join(HOME, ".claude.json");
+    const data = JSON.parse(readFileSync(claudeJson, "utf-8"));
+    const oa = data.oauthAccount;
+    if (oa && oa.emailAddress) {
+      _claudeAccountCache = {
+        email: oa.emailAddress,
+        organization: oa.organizationName || null,
+        role: oa.organizationRole || null,
+      };
+      return _claudeAccountCache;
+    }
+  } catch { /* no file or no oauth account */ }
+  _claudeAccountCache = null;
+  return null;
+}
+
+/**
+ * Read Codex account info by decoding the id_token JWT in ~/.codex/auth.json.
+ * Returns { email, name } | null.
+ */
+let _codexAccountCache = undefined;
+function readCodexAccount() {
+  if (_codexAccountCache !== undefined) return _codexAccountCache;
+  try {
+    const authPath = join(process.env.CODEX_HOME || join(HOME, ".codex"), "auth.json");
+    const auth = JSON.parse(readFileSync(authPath, "utf-8"));
+    const idToken = auth.tokens?.id_token;
+    if (!idToken) {
+      _codexAccountCache = null;
+      return null;
+    }
+    const parts = idToken.split(".");
+    if (parts.length < 2) {
+      _codexAccountCache = null;
+      return null;
+    }
+    // Decode the JWT payload (base64url)
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+    const payload = JSON.parse(Buffer.from(b64 + pad, "base64").toString("utf-8"));
+    _codexAccountCache = {
+      email: payload.email || null,
+      name: payload.name || null,
+    };
+    return _codexAccountCache;
+  } catch { /* no file or invalid token */ }
+  _codexAccountCache = null;
   return null;
 }
 
@@ -4201,6 +4341,12 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
     while (allLines.length < rows) allLines.push("");
     return allLines;
   }
+  if (data._error) {
+    allLines.push(C.costRed + "Error reading session data:" + RESET);
+    allLines.push(C.dimText + data._error + RESET);
+    while (allLines.length < rows) allLines.push("");
+    return allLines;
+  }
 
   // Alias: allLines as lines inside the generation block for readability
   const lines = allLines;
@@ -4208,9 +4354,14 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
   session._copyTargets = [];
   const prov = session.provider === "claude" ? "Claude" : "Codex";
   const sid = session.session_id || "unknown";
-  const shortSid = sid.length > w - 10 ? sid.slice(0, w - 13) + "..." : sid;
   const pm = session.process;
   const now = Date.now();
+
+  // Two-column layout when wide enough; otherwise single column.
+  const twoCol = w >= 70;
+  const leftW = twoCol ? Math.floor((w - 3) / 2) : w; // 3 for "  │ " divider
+  const rightW = twoCol ? (w - leftW - 3) : 0;
+  const rightStartCol = leftW + 4; // column offset for right-side copy targets ("  │ ")
 
   // Helper: copy icon with flash
   function copyIcon(field) {
@@ -4218,57 +4369,68 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
     return flash ? `\x1b[38;5;114m✓${RESET}` : `\x1b[38;5;60m⧉${RESET}`;
   }
 
-  // Helper: register a copyable line (icon near label)
-  function addCopyLine(label, value, fullValue, field, labelW) {
-    const lw = labelW || 5;
-    // "Label ⧉" then pad to labelW+2, then value
-    const labelWithIcon = `${C.hdrLabel}${label}${RESET} ${copyIcon(field)}`;
-    const padNeeded = Math.max(0, lw - label.length - 1); // -1 for icon char width
-    lines.push(`${labelWithIcon}${" ".repeat(padNeeded)} ${C.hdrValue}${value}${RESET}`);
-    session._copyTargets.push({ line: lines.length - 1, field, value: fullValue || value });
+  // Layout: "LABEL ⧉" right after label, then pad to a fixed value column.
+  // Both renderField and renderPlain put VALUE at the same column (labelW + 2)
+  // so values line up regardless of label length or whether there's an icon.
+
+  // Helper: render label + icon + value.
+  // Returns { rendered, iconCol } where iconCol is the column index of ⧉.
+  function renderField(label, value, fullValue, field, labelW, maxWidth) {
+    // Value column = labelW + 2 (room for " ⧉" right after label, then a space)
+    const valueAvail = maxWidth - labelW - 2;
+    const truncated = (value && value.length > valueAvail) ? value.slice(0, Math.max(1, valueAvail - 1)) + "…" : value;
+    // "LABEL ⧉" + spaces to reach labelW + " " + VALUE
+    // Icon is at column label.length + 1 (right after first space)
+    const padAfterIcon = Math.max(0, labelW - label.length - 1); // -1 accounts for icon (treated as 1 wide)
+    const rendered = `${C.hdrLabel}${label}${RESET} ${copyIcon(field)}${" ".repeat(padAfterIcon)} ${C.hdrValue}${truncated || ""}${RESET}`;
+    return { rendered, iconCol: label.length + 1, fullValue: fullValue || value };
   }
 
-  // ── Identity ──
+  // Render a plain label/value at the same value column as renderField.
+  function renderPlain(label, value, labelW) {
+    // Match renderField alignment: label + (labelW - label.length) spaces + " " + value
+    // = total labelW + 1 chars before value (vs renderField also labelW + 1)
+    const labelPad = " ".repeat(Math.max(0, labelW - label.length));
+    return `${C.hdrLabel}${label}${labelPad}${RESET}  ${C.hdrValue}${value || ""}${RESET}`;
+  }
+
+  // Helper: pad an ANSI-colored string to a target visible width.
+  function padAnsi(s, w) {
+    const plain = (s || "").replace(/\x1b\[[^m]*m/g, "");
+    return (s || "") + " ".repeat(Math.max(0, w - plain.length));
+  }
+
+  // Track copy target with its column offset (for click detection)
+  function trackCopy(lineIdx, field, value, col) {
+    session._copyTargets.push({ line: lineIdx, field, value, col });
+  }
+
+  // ── Build left and right field sets ──
+  const m = safeMetrics(data);
   const displayModel = data.lastModel || session.model || (data.models || [data.model])[0] || "?";
   const provColor = session.provider === "claude" ? "\x1b[38;5;173m" : "\x1b[38;5;110m";
   const ml = displayModel.toLowerCase();
   const mdlColor = ml.startsWith("claude") ? "\x1b[38;5;173m"
     : (ml.startsWith("gpt") || ml.startsWith("o1") || ml.startsWith("o3") || ml.startsWith("o4")) ? "\x1b[38;5;110m"
     : C.hdrValue;
-  lines.push(`${C.hdrLabel}Type${RESET}       ${provColor}${prov}${RESET}  ${C.hdrLabel}Model${RESET} ${mdlColor}${displayModel}${RESET}`);
-  addCopyLine("ID", shortSid, sid, "id", 9);
-  if (data.customTitle) {
-    const maxTitleW = w - 12;
-    const displayTitle = data.customTitle.length > maxTitleW ? data.customTitle.slice(0, maxTitleW - 3) + "..." : data.customTitle;
-    addCopyLine("Title", displayTitle, data.customTitle, "title", 9);
-  }
-  {
-    const resumeId = data.customTitle || sid;
-    const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${resumeId}` : `codex resume ${resumeId}`);
-    const maxCmdW = w - 12;
-    const cmd = fullCmd.length > maxCmdW ? fullCmd.slice(0, maxCmdW - 3) + "..." : fullCmd;
-    addCopyLine("Cmd", cmd, fullCmd, "cmd", 9);
-  }
 
-  // ── Location ──
+  const fullCmd = (pm && pm.command) || (session.provider === "claude" ? `claude --resume ${sid}` : `codex resume ${sid}`);
+  const title = data.title || session.title;
   const proj = session.label_source || "unknown";
-  const shortProj = proj.length > w - 12 ? "…" + proj.slice(-(w - 13)) : proj;
-  addCopyLine("Dir", shortProj, proj, "dir", 9);
+  const acct = session.provider === "claude" ? readClaudeAccount() : readCodexAccount();
 
-  // Started + duration
-  const m = safeMetrics(data);
+  // Started + durations
+  let startedStr = null, apiStr = null, wallStr = null;
   if (session.started_at) {
     const d = parseTimestamp(session.started_at);
-    const started = d ? d.toLocaleString() : session.started_at;
-    lines.push(`${C.hdrLabel}Started${RESET}    ${C.hdrValue}${started}${RESET}`);
+    startedStr = d ? d.toLocaleString() : session.started_at;
     if (session.provider === "claude") {
       if (m.api_duration_ms > 0) {
         const apiSec = Math.round(m.api_duration_ms / 1000);
         const apiH = Math.floor(apiSec / 3600);
         const apiM = Math.floor((apiSec % 3600) / 60);
         const apiS = apiSec % 60;
-        const apiStr = apiH > 0 ? `${apiH}h ${apiM}m ${apiS}s` : apiM > 0 ? `${apiM}m ${apiS}s` : `${apiS}s`;
-        lines.push(`${C.hdrLabel}API time${RESET}   ${C.hdrValue}${apiStr}${RESET}`);
+        apiStr = apiH > 0 ? `${apiH}h ${apiM}m ${apiS}s` : apiM > 0 ? `${apiM}m ${apiS}s` : `${apiS}s`;
       }
       if (session.last_active) {
         const start = parseTimestamp(session.started_at);
@@ -4278,26 +4440,104 @@ function renderSessionInfoPanel(session, data, plan, panelW, rows, scrollTop, st
           const wH = Math.floor(wallSec / 3600);
           const wM = Math.floor((wallSec % 3600) / 60);
           const wS = wallSec % 60;
-          const wallStr = wH > 0 ? `${wH}h ${wM}m ${wS}s` : wM > 0 ? `${wM}m ${wS}s` : `${wS}s`;
-          lines.push(`${C.hdrLabel}Wall time${RESET}  ${C.hdrValue}${wallStr}${RESET}`);
+          wallStr = wH > 0 ? `${wH}h ${wM}m ${wS}s` : wM > 0 ? `${wM}m ${wS}s` : `${wS}s`;
         }
       }
     }
   }
 
+  const labelW = 8; // must be >= max(label.length) + 1 for icon padding to work
+
+  // ── Header row spans full width: Type + Model together ──
+  // Aligns "Type" value column with the rows below (value at col labelW+2).
+  const typeLabel = `${C.hdrLabel}Type${" ".repeat(labelW - 4)}${RESET}  ${provColor}${prov}${RESET}`;
+  const modelLabel = `${C.hdrLabel}Model${RESET}   ${mdlColor}${displayModel}${RESET}`;
+  lines.push(`${typeLabel}    ${modelLabel}`);
+
+  // Left column: identity fields (with copy icons)
+  // Right column: account/timing info
+  const leftRows = [];
+  const rightRows = [];
+
+  // Left rows: identity & location
+  {
+    const r = renderField("ID", sid, sid, "id", labelW, twoCol ? leftW : w);
+    leftRows.push({ rendered: r.rendered, copy: { field: "id", value: sid, iconCol: r.iconCol } });
+  }
+  if (title) {
+    const r = renderField("Title", title, title, "title", labelW, twoCol ? leftW : w);
+    leftRows.push({ rendered: r.rendered, copy: { field: "title", value: title, iconCol: r.iconCol } });
+  }
+  {
+    const r = renderField("Dir", proj, proj, "dir", labelW, twoCol ? leftW : w);
+    leftRows.push({ rendered: r.rendered, copy: { field: "dir", value: proj, iconCol: r.iconCol } });
+  }
+  {
+    const r = renderField("Cmd", fullCmd, fullCmd, "cmd", labelW, twoCol ? leftW : w);
+    leftRows.push({ rendered: r.rendered, copy: { field: "cmd", value: fullCmd, iconCol: r.iconCol } });
+  }
+
+  // Right rows: account & timing
+  if (acct && acct.email) {
+    const r = renderField("Account", acct.email, acct.email, "account", labelW, twoCol ? rightW : w);
+    rightRows.push({ rendered: r.rendered, copy: { field: "account", value: acct.email, iconCol: r.iconCol } });
+  }
+  if (acct && acct.organization) {
+    rightRows.push({ rendered: renderPlain("Org", acct.organization, labelW) });
+  }
+  if (startedStr) rightRows.push({ rendered: renderPlain("Started", startedStr, labelW) });
+  if (apiStr)     rightRows.push({ rendered: renderPlain("API", apiStr, labelW) });
+  if (wallStr)    rightRows.push({ rendered: renderPlain("Wall", wallStr, labelW) });
+
+  // Render side-by-side (or stacked if narrow)
+  if (twoCol) {
+    const totalL = Math.max(leftRows.length, rightRows.length);
+    for (let i = 0; i < totalL; i++) {
+      const L = leftRows[i] || { rendered: "" };
+      const R = rightRows[i] || { rendered: "" };
+      lines.push(padAnsi(L.rendered, leftW) + "  " + "\x1b[38;5;238m│\x1b[0m " + R.rendered);
+      const lineIdx = lines.length - 1;
+      if (L.copy) trackCopy(lineIdx, L.copy.field, L.copy.value, L.copy.iconCol);
+      if (R.copy) trackCopy(lineIdx, R.copy.field, R.copy.value, rightStartCol + R.copy.iconCol);
+    }
+  } else {
+    // Single column: left rows then right rows
+    for (const row of leftRows) {
+      lines.push(row.rendered);
+      if (row.copy) trackCopy(lines.length - 1, row.copy.field, row.copy.value, row.copy.iconCol);
+    }
+    for (const row of rightRows) {
+      lines.push(row.rendered);
+      if (row.copy) trackCopy(lines.length - 1, row.copy.field, row.copy.value, row.copy.iconCol);
+    }
+  }
+
+  // Build a horizontal separator that joins the column divider with a T-junction.
+  // When in two-column mode, put a ┴ at the column where │ was.
+  function fullSep() {
+    if (!twoCol) return dimRule + "─".repeat(w) + RESET;
+    // 0..leftW+1 : ─, then ┴ at leftW+2, then ─ to end
+    const leftPart = "─".repeat(leftW + 2);
+    const rightPart = "─".repeat(Math.max(0, w - leftW - 3));
+    return dimRule + leftPart + "┴" + rightPart + RESET;
+  }
+
   // ── Lines added/removed (Claude only) ──
+  let linesAddedRemoved = false;
   if (session.provider === "claude" && (m.lines_added > 0 || m.lines_removed > 0)) {
-    lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
+    lines.push(fullSep());
+    linesAddedRemoved = true;
     const addStr = m.lines_added > 0 ? `${C.hdrLabel}+${RESET}\x1b[38;5;114m${m.lines_added.toLocaleString()}${RESET}` : "";
     const remStr = m.lines_removed > 0 ? `${C.hdrLabel}-${RESET}\x1b[38;5;203m${m.lines_removed.toLocaleString()}${RESET}` : "";
     const sep = m.lines_added > 0 && m.lines_removed > 0 ? `  ` : "";
-    lines.push(`${C.hdrLabel}Lines${RESET}      ${addStr}${sep}${remStr}`);
+    lines.push(`${C.hdrLabel}Lines${RESET}     ${addStr}${sep}${remStr}`);
   }
 
   // ── Context headroom ──
   const ctx = session.list_context;
   if (ctx) {
-    lines.push(dimRule + "─".repeat(Math.min(w, 40)) + RESET);
+    // Only show the joining T-junction separator if we haven't already drawn one above
+    lines.push(linesAddedRemoved ? dimRule + "─".repeat(w) + RESET : fullSep());
 
     if (ctx.compacting) {
       const flash = Math.floor(Date.now() / 600) % 2 === 0;
@@ -6315,7 +6555,11 @@ function handleEvent(event, state) {
         if (selected && selected._copyTargets) {
           for (const target of selected._copyTargets) {
             const screenRow = state._tabBarRow + 2 + target.line; // +2 for tab bar + rule
-            if (event.row === screenRow && event.col >= 5 && event.col <= 10) {
+            if (event.row !== screenRow) continue;
+            // Account for panel border "│ " (cols 0-1) when computing icon column
+            // target.col is the column inside the inner content area
+            const iconScreenCol = 2 + (target.col || 0);
+            if (event.col >= iconScreenCol && event.col <= iconScreenCol + 2) {
               copyToClipboard(target.value);
               selected._copyFlash = target.field;
               selected._copyFlashTs = Date.now();
@@ -6763,7 +7007,8 @@ function renderGroupedLines(codexSessions, claudeSessions, codexPlan, claudePlan
     );
     const labels = abbreviatePaths(codexSessions.map((s) => s.label_source));
     for (let i = 0; i < codexSessions.length; i++) {
-      lines.push(formatSessionLine(i + 1, codexSessions[i], labels[i], width));
+      const label = codexSessions[i].title || labels[i];
+      lines.push(formatSessionLine(i + 1, codexSessions[i], label, width));
     }
   }
   lines.push("");
@@ -6776,10 +7021,11 @@ function renderGroupedLines(codexSessions, claudeSessions, codexPlan, claudePlan
     );
     const labels = abbreviatePaths(claudeSessions.map((s) => s.label_source));
     for (let i = 0; i < claudeSessions.length; i++) {
+      const label = claudeSessions[i].title || labels[i];
       lines.push(formatSessionLine(
         codexSessions.length + i + 1,
         claudeSessions[i],
-        labels[i],
+        label,
         width
       ));
     }
@@ -6957,12 +7203,15 @@ async function main() {
           const m = safeMetrics(data);
           const plan = s.provider === "codex" ? codexPlan : claudePlan;
           const incl = planIncludesProvider(plan, s.provider);
+          const acct = s.provider === "claude" ? readClaudeAccount() : readCodexAccount();
           const obj = {
             provider: s.provider,
             session_id: s.session_id,
             started_at: s.started_at,
             last_active: s.last_active,
             project: s.label_source || null,
+            title: (data && data.title) || s.title || null,
+            account: acct,
             model: s.model || (data && data.model) || null,
             models: (data && data.models) || [s.model || null],
             plan,
