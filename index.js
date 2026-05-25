@@ -48,9 +48,10 @@ import { spawn, execSync } from "node:child_process";
 // ---------------------------------------------------------------------------
 
 const HOME = homedir();
-const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(HOME, ".claude");
+const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || join(HOME, ".pi");
+const PI_AGENT_DIR = join(CLAUDE_CONFIG_DIR, "agent");
 const CODEX_SESSIONS_ROOT = join(HOME, ".codex", "sessions");
-const CLAUDE_PROJECTS_ROOT = join(CLAUDE_CONFIG_DIR, "projects");
+const CLAUDE_PROJECTS_ROOT = join(PI_AGENT_DIR, "sessions");
 const UUID_RE = /([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/;
 const FULL_UUID_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const SESSION_DATA_CACHE = new Map();
