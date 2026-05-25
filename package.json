@@ -26,7 +26,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ldegio/agtop.git"
+    "url": "git+https://github.com/FluidLogicLabs/pi-agtop.git"
   },
   "homepage": "https://github.com/ldegio/agtop",
   "author": "Loris Degioanni",
